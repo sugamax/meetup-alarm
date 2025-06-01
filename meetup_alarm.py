@@ -111,6 +111,7 @@ class MeetupBot(commands.Bot):
         self.post_day = CONFIG['meetup_configs'].get('post_day', 'Monday')
         self.post_time = CONFIG['meetup_configs'].get('post_time', '09:30')
         self.timezone = CONFIG['meetup_configs'].get('timezone', 'America/Denver')
+        self.immediate_mode = False
 
     def load_meetup_configs(self) -> List[MeetupConfig]:
         return [MeetupConfig(cfg) for cfg in CONFIG['meetup_configs']['locations']]
@@ -124,6 +125,11 @@ class MeetupBot(commands.Bot):
         self.channel = self.get_channel(self.discord_channel_id)
         if not self.channel:
             logger.error(f"Could not find channel with ID {self.discord_channel_id}")
+            await self.close()
+            return
+        # If running in immediate mode, post events and exit
+        if self.immediate_mode:
+            await self.meetup_task()
             await self.close()
 
     async def weekly_meetup_task(self):
@@ -262,7 +268,6 @@ def get_meetup_events(search_term: str, location: str, radius: int) -> List[Dict
                         all_event_data.extend(data)
                     else:
                         all_event_data.append(data)
-                    logger.debug(f"Successfully parsed JSON-LD data from script {i}")
                 except json.JSONDecodeError as e:
                     logger.error(f"Error parsing JSON-LD data from script {i}: {e}")
                     continue
@@ -272,9 +277,6 @@ def get_meetup_events(search_term: str, location: str, radius: int) -> List[Dict
             return events
             
         logger.info(f"Found {len(all_event_data)} total items in JSON-LD data")
-        
-        # Log the raw JSON data for debugging
-        logger.debug(f"Raw JSON-LD data: {json.dumps(all_event_data, indent=2)}")
         
         for event in all_event_data:
             try:
@@ -322,6 +324,11 @@ def get_meetup_events(search_term: str, location: str, radius: int) -> List[Dict
                     group = organizer.get('name', 'Unknown Group')
                 else:
                     group = 'Unknown Group'
+                event_attendance_mode = event.get('eventAttendanceMode')
+                if event_attendance_mode == 'https://schema.org/OnlineEventAttendanceMode':
+                    attendance_mode = 'online'
+                else:
+                    attendance_mode = 'offline'
                 event_data = {
                     'title': title,
                     'url': url,
@@ -329,17 +336,10 @@ def get_meetup_events(search_term: str, location: str, radius: int) -> List[Dict
                     'location': location,
                     'group': group,
                     'description': event.get('description', ''),
-                    'search_term': search_term  # Track which search term matched
+                    'search_term': search_term,  # Track which search term matched
+                    'eventAttendanceMode': attendance_mode
                 }
                 events.append(event_data)
-                # Log each event in a readable format
-                logger.info(f"\nEvent found:\n"
-                          f"Title: {title}\n"
-                          f"Group: {group}\n"
-                          f"Time: {event_time}\n"
-                          f"Location: {location}\n"
-                          f"URL: {url}\n"
-                          f"{'='*50}")
             except Exception as e:
                 logger.error(f"Error parsing event data: {e}")
                 continue
@@ -439,9 +439,13 @@ def format_event_message(event):
     links = ""
     # Do not add the Check Location link here; only show as a button
 
+
+    # Add online indicator if it's an online event
+    online_text = " | ☎️ Online" if event.get('eventAttendanceMode') == 'online' else ""
+
     message = (
         f"# {clean_title}\n"
-        f"**{event['group']}** | **{date_text}**\n"
+        f"**{event['group']}** | **{date_text}**{online_text}\n"
         f"\n"  # Add an extra empty line after the date
     )
     
@@ -471,11 +475,9 @@ def main():
 
     bot = MeetupBot()
     if args.now:
-        # Run the event posting task immediately, then exit
+        bot.immediate_mode = True
         async def run_once():
-            await bot.setup_hook()
-            await bot.meetup_task()
-            await bot.close()
+            await bot.start(DISCORD_TOKEN, reconnect=False)
         asyncio.run(run_once())
     else:
         bot.run(DISCORD_TOKEN)
