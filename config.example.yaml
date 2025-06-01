@@ -1,0 +1,18 @@
+meetup_configs:
+  post_day: "Monday"         # Day of week to post (e.g., Monday)
+  post_time: "09:30"         # Time to post (24h format, e.g., 09:30)
+  timezone: "America/Denver" # Timezone for scheduling
+  discord_channel_id: "YOUR_DISCORD_CHANNEL_ID"
+  locations:
+    - name: "Denver Tech"
+      icon: "🌄"
+      search_terms:
+        - "tech"
+        - "developer"
+        - "coding"
+        - "startup"
+        - "founder"
+        - "tech startup"
+        - "founders"
+      location: "Denver, CO"
+      radius: 40 

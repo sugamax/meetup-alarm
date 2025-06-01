@@ -1,0 +1,15 @@
+[Unit]
+Description=Meetup Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/meetup-alarm
+ExecStart=/usr/bin/python3 /home/ec2-user/meetup-alarm/meetup_alarm.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target 
