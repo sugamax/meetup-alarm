@@ -18,6 +18,9 @@ import re
 import pytz
 import calendar
 import argparse
+import uuid
+import traceback
+import sqlite3
 
 # Load environment variables
 load_dotenv()
@@ -52,57 +55,146 @@ class MeetupConfig:
         self.location = config['location']
         self.radius = config.get('radius', 25)
 
-class CreateEventButton(discord.ui.View):
-    def __init__(self, event_data, calendar_url, location_url=None):
-        super().__init__(timeout=None)  # Button never times out
-        self.event_data = event_data
-        # Remove '[Meetup]' prefix from the button label
-        self.add_item(discord.ui.Button(label="Add to Google Calendar", style=discord.ButtonStyle.secondary, emoji="🗓️", url=calendar_url))
-        # Add Check Location button with pin icon if location_url is provided
-        if location_url:
-            self.add_item(discord.ui.Button(label="Check Location", style=discord.ButtonStyle.secondary, emoji="📍", url=location_url))
+class CreateEventButton(discord.ui.Button):
+    def __init__(self, event_uuid, calendar_url, location_url, disabled=False):
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="Create Discord Event" if not disabled else "Event Created!",
+            emoji="✅",
+            custom_id=f"create_event_{event_uuid}" if event_uuid else "create_event_*",
+            disabled=disabled
+        )
+        self.event_uuid = event_uuid
+        self.calendar_url = calendar_url
+        self.location_url = location_url
 
-    @discord.ui.button(label="Create Discord Event", style=discord.ButtonStyle.primary, emoji="✅")
-    async def create_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
         try:
-            await interaction.response.defer(ephemeral=True)
-
-            # Prepare event data for external event
-            event_url = self.event_data.get('url')
-            event_name = self.event_data['name']
-            start_time = self.event_data['start_time']
-            end_time = self.event_data['end_time']
-            location = self.event_data['location']
-            # Set the description to the Meetup event link
-            description = event_url if event_url else ''
-
-            # Create the event as an external event
-            event = await interaction.guild.create_scheduled_event(
-                name=event_name,
-                start_time=start_time,
-                end_time=end_time,
+            logger.info("=== CreateEventButton callback started ===")
+            logger.info(f"Button custom_id: {self.custom_id}")
+            logger.info(f"Event UUID: {self.event_uuid}")
+            logger.info(f"Interaction user: {interaction.user.name} (ID: {interaction.user.id})")
+            logger.info(f"Interaction message ID: {interaction.message.id}")
+            
+            # Extract UUID from custom_id
+            custom_id = interaction.data.get('custom_id', '')
+            event_uuid = custom_id.replace('create_event_', '')
+            
+            # Get event data from bot's event_data_map
+            bot = interaction.client
+            event_data = bot.event_data_map.get(event_uuid)
+            
+            if not event_data:
+                logger.error(f"Event data not found for UUID: {event_uuid}")
+                await interaction.response.send_message("❌ Error: Event data not found. The bot may have been restarted.", ephemeral=True)
+                return
+            
+            # Log event data for debugging
+            logger.info(f"Creating Discord event with data: {event_data}")
+            logger.info(f"Start time: {event_data['start_time']} (tzinfo: {event_data['start_time'].tzinfo})")
+            logger.info(f"End time: {event_data['end_time']} (tzinfo: {event_data['end_time'].tzinfo})")
+            
+            # Ensure timezone awareness
+            if event_data['start_time'].tzinfo is None:
+                event_data['start_time'] = pytz.timezone(bot.timezone).localize(event_data['start_time'])
+            if event_data['end_time'].tzinfo is None:
+                event_data['end_time'] = pytz.timezone(bot.timezone).localize(event_data['end_time'])
+            
+            # Create the scheduled event
+            scheduled_event = await interaction.guild.create_scheduled_event(
+                name=f"[Meetup] {event_data['title']}",
+                description=event_data['url'],
+                start_time=event_data['start_time'],
+                end_time=event_data['end_time'],
                 entity_type=discord.EntityType.external,
-                location=location,
-                description=description,
-                privacy_level=discord.PrivacyLevel.guild_only
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=event_data.get('location', 'Online')
             )
+            
+            # Always generate calendar and location URLs from event_data
+            title = event_data['title']
+            event_time = event_data['start_time']
+            start_date = event_time.strftime('%Y%m%dT%H%M%S')
+            end_date = (event_time + timedelta(hours=1)).strftime('%Y%m%dT%H%M%S')
+            calendar_title = title[:100]
+            calendar_url = (
+                f"https://calendar.google.com/calendar/render"
+                f"?action=TEMPLATE"
+                f"&text={urllib.parse.quote(calendar_title)}"
+                f"&dates={start_date}/{end_date}"
+                f"&details={urllib.parse.quote(event_data['url'])}"
+            )
+            location_text = event_data.get('location', '')
+            if location_text and str(location_text).strip():
+                location_text_truncated = str(location_text)[:100]
+                calendar_url += f"&location={urllib.parse.quote(location_text_truncated)}"
+                location_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(location_text_truncated)}"
+            else:
+                location_url = None
 
-            button.disabled = True
-            button.label = "Event Created!"
-            await interaction.message.edit(view=self)
-            await interaction.followup.send(f"✅ Created Discord event: {event.name}", ephemeral=True)
+            # Determine if the event is online
+            is_online = False
+            attendance_mode = event_data.get('eventAttendanceMode')
+            if attendance_mode == 'online' or (isinstance(attendance_mode, str) and 'online' in attendance_mode.lower()):
+                is_online = True
 
-        except discord.errors.Forbidden as e:
-            logger.error(f"Permission error creating Discord event: {e}\nEvent data: {self.event_data}")
-            await interaction.followup.send("❌ I don't have permission to create events in this server. Please make sure I have the 'Manage Events' permission.", ephemeral=True)
+            # Rebuild the view with the button disabled and correct URLs
+            new_view = CreateEventView(event_uuid, calendar_url, location_url, disabled=True, location_text=location_text)
+            await interaction.message.edit(view=new_view)
+            
+            # Send confirmation
+            await interaction.response.send_message(f"✅ Created Discord event: [Meetup] {event_data['title']}", ephemeral=True)
+            
+            # Remove event data after successful creation
+            del bot.event_data_map[event_uuid]
+            bot.delete_event_data(event_uuid)
+            
         except Exception as e:
-            logger.error(f"Error creating Discord event: {e}\nEvent data: {self.event_data}")
-            await interaction.followup.send("❌ Failed to create Discord event. Please try again later.", ephemeral=True)
+            logger.error(f"Error creating event: {e}")
+            logger.error(traceback.format_exc())
+            await interaction.response.send_message(f"❌ Error creating event: {str(e)}", ephemeral=True)
+
+class CalendarButton(discord.ui.Button):
+    def __init__(self, calendar_url):
+        super().__init__(
+            style=discord.ButtonStyle.link,
+            label="Add to Google Calendar",
+            emoji="📅",
+            url=calendar_url
+        )
+
+class LocationButton(discord.ui.Button):
+    def __init__(self, location_url):
+        super().__init__(
+            style=discord.ButtonStyle.link,
+            label="Check Location",
+            emoji="📍",
+            url=location_url
+        )
+
+class CreateEventView(discord.ui.View):
+    def __init__(self, event_uuid, calendar_url, location_url, disabled=False, location_text=None):
+        super().__init__(timeout=None)  # No timeout for persistent view
+        self.add_item(CreateEventButton(event_uuid, calendar_url, location_url, disabled=disabled))
+        if calendar_url:
+            self.calendar_button = CalendarButton(calendar_url)
+            self.add_item(self.calendar_button)
+        # Only add location button if location_text is not 'Online'
+        if location_url and location_text and location_text.strip().lower() != 'online':
+            self.location_button = LocationButton(location_url)
+            self.add_item(self.location_button)
+
+    @classmethod
+    async def from_uuid(cls, event_uuid: str, calendar_url: str, location_url: str, disabled=False, location_text=None):
+        """Create a view instance from a UUID"""
+        view = cls(event_uuid, calendar_url, location_url, disabled=disabled, location_text=location_text)
+        return view
 
 class MeetupBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.guild_scheduled_events = True
         super().__init__(command_prefix='!', intents=intents)
         self.channel = None
         self.meetup_configs = self.load_meetup_configs()
@@ -112,12 +204,147 @@ class MeetupBot(commands.Bot):
         self.post_time = CONFIG['meetup_configs'].get('post_time', '09:30')
         self.timezone = CONFIG['meetup_configs'].get('timezone', 'America/Denver')
         self.immediate_mode = False
+        self.event_data_map = {}
+        self.db_path = 'events.db'
+        self.init_db()  # Initialize database on startup
+        self.load_event_data()  # Load event data from database
+
+    def init_db(self):
+        """Initialize SQLite database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS events (
+                    uuid TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    location TEXT,
+                    description TEXT,
+                    url TEXT NOT NULL,
+                    calendar_url TEXT,
+                    location_url TEXT
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            logger.error(traceback.format_exc())
+
+    def load_event_data(self):
+        """Load event data from SQLite database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('SELECT * FROM events')
+            rows = c.fetchall()
+            
+            for row in rows:
+                uuid, title, start_time, end_time, location, description, url, calendar_url, location_url = row
+                try:
+                    # Parse datetime strings with timezone info
+                    start_dt = datetime.fromisoformat(start_time)
+                    end_dt = datetime.fromisoformat(end_time)
+                    
+                    # Ensure timezone awareness
+                    if start_dt.tzinfo is None:
+                        start_dt = pytz.timezone(self.timezone).localize(start_dt)
+                    if end_dt.tzinfo is None:
+                        end_dt = pytz.timezone(self.timezone).localize(end_dt)
+                    
+                    # Log the loaded event data for debugging
+                    logger.info(f"Loading event {uuid}:")
+                    logger.info(f"  Title: {title}")
+                    logger.info(f"  Start time: {start_dt} (tzinfo: {start_dt.tzinfo})")
+                    logger.info(f"  End time: {end_dt} (tzinfo: {end_dt.tzinfo})")
+                    
+                    self.event_data_map[uuid] = {
+                        'title': title,
+                        'start_time': start_dt,
+                        'end_time': end_dt,
+                        'location': location,
+                        'description': description,
+                        'url': url,
+                        'calendar_url': calendar_url,
+                        'location_url': location_url
+                    }
+                except ValueError as e:
+                    logger.error(f"Error parsing datetime for event {uuid}: {e}")
+                    continue
+                    
+            conn.close()
+            logger.info(f"Loaded {len(self.event_data_map)} events from database")
+        except Exception as e:
+            logger.error(f"Error loading event data from database: {e}")
+            logger.error(traceback.format_exc())
+            self.event_data_map = {}
+
+    def save_event_data(self, event_uuid, event_data):
+        """Save event data to SQLite database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            # Convert datetime objects to ISO format strings with timezone info
+            event_data_copy = event_data.copy()
+            # Ensure datetime objects are timezone-aware
+            if event_data['start_time'].tzinfo is None:
+                event_data_copy['start_time'] = pytz.timezone(self.timezone).localize(event_data['start_time'])
+            if event_data['end_time'].tzinfo is None:
+                event_data_copy['end_time'] = pytz.timezone(self.timezone).localize(event_data['end_time'])
+            
+            event_data_copy['start_time'] = event_data_copy['start_time'].isoformat()
+            event_data_copy['end_time'] = event_data_copy['end_time'].isoformat()
+            
+            c.execute('''
+                INSERT OR REPLACE INTO events 
+                (uuid, title, start_time, end_time, location, description, url, calendar_url, location_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                event_uuid,
+                event_data_copy['title'],
+                event_data_copy['start_time'],
+                event_data_copy['end_time'],
+                event_data_copy.get('location', 'Online'),
+                event_data_copy.get('description', ''),
+                event_data_copy['url'],
+                event_data_copy.get('calendar_url'),
+                event_data_copy.get('location_url')
+            ))
+            conn.commit()
+            conn.close()
+            logger.info(f"Saved event {event_uuid} to database")
+        except Exception as e:
+            logger.error(f"Error saving event data to database: {e}")
+            logger.error(traceback.format_exc())
+
+    def delete_event_data(self, event_uuid):
+        """Delete event data from SQLite database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('DELETE FROM events WHERE uuid = ?', (event_uuid,))
+            conn.commit()
+            conn.close()
+            logger.info(f"Deleted event {event_uuid} from database")
+        except Exception as e:
+            logger.error(f"Error deleting event data from database: {e}")
+            logger.error(traceback.format_exc())
 
     def load_meetup_configs(self) -> List[MeetupConfig]:
         return [MeetupConfig(cfg) for cfg in CONFIG['meetup_configs']['locations']]
 
-    async def setup_hook(self) -> None:
-        logger.info(f"Logged in as {self.user.name}")
+    async def setup_hook(self):
+        """Set up the bot's initial state."""
+        # Register views for all loaded events
+        for event_uuid, event_data in self.event_data_map.items():
+            logger.info(f"Registering view for event: {event_uuid}")
+            self.add_view(CreateEventView(event_uuid, event_data.get('calendar_url', ''), event_data.get('location_url', '')))
+        
+        # Start the weekly meetup task as a background task
         self.bg_task = self.loop.create_task(self.weekly_meetup_task())
 
     async def on_ready(self):
@@ -131,6 +358,20 @@ class MeetupBot(commands.Bot):
         if self.immediate_mode:
             await self.meetup_task()
             await self.close()
+
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Log all interactions"""
+        logger.info(f"Received interaction: {interaction.type}")
+        logger.info(f"Interaction data: {interaction.data}")
+        if interaction.type == discord.InteractionType.component:
+            logger.info(f"Component ID: {interaction.data.get('custom_id')}")
+            logger.info(f"Component type: {interaction.data.get('component_type')}")
+            logger.info(f"User: {interaction.user.name} (ID: {interaction.user.id})")
+            logger.info(f"Message ID: {interaction.message.id}")
+            logger.info(f"Channel: {interaction.channel.name} (ID: {interaction.channel.id})")
+            logger.info(f"Guild: {interaction.guild.name} (ID: {interaction.guild.id})")
+            # Let the view handle the interaction
+            await self.process_application_commands(interaction)
 
     async def weekly_meetup_task(self):
         await self.wait_until_ready()
@@ -176,8 +417,14 @@ class MeetupBot(commands.Bot):
         unique_events = {event['title']: event for event in all_events}.values()
         logger.info(f"Found {len(unique_events)} unique events after deduplication")
 
+        # Only keep future events
+        tz = pytz.timezone(self.timezone)
+        now = datetime.now(tz)
+        future_events = [event for event in unique_events if event['time'] > now]
+        logger.info(f"Filtered to {len(future_events)} future events")
+
         # Sort events by date
-        sorted_events = sorted(unique_events, key=lambda x: x['time'])
+        sorted_events = sorted(future_events, key=lambda x: x['time'])
 
         # Group events by week
         today = datetime.now().astimezone()  # Make today timezone-aware
@@ -218,7 +465,27 @@ class MeetupBot(commands.Bot):
             for event in events:
                 try:
                     message_data = format_event_message(event)
-                    view = CreateEventButton(message_data['event_data'], message_data['calendar_url'], message_data['location_url'])
+                    # Check if this event already exists in the database
+                    conn = sqlite3.connect(self.db_path)
+                    c = conn.cursor()
+                    c.execute('SELECT uuid FROM events WHERE title = ? AND start_time = ?', 
+                             (message_data['event_data']['title'], 
+                              message_data['event_data']['start_time'].isoformat()))
+                    result = c.fetchone()
+                    conn.close()
+
+                    if result:
+                        # Use existing UUID
+                        event_uuid = result[0]
+                    else:
+                        # Generate new UUID
+                        event_uuid = str(uuid.uuid4())
+                        # Store event data in the mapping
+                        self.event_data_map[event_uuid] = message_data['event_data']
+                        # Save event data to database
+                        self.save_event_data(event_uuid, message_data['event_data'])
+
+                    view = CreateEventView(event_uuid, message_data['calendar_url'], message_data['location_url'], location_text=message_data['location_text'])
                     await self.channel.send(message_data['message'], view=view)
                     logger.info(f"Posted event: {event['title']}")
                     await asyncio.sleep(2)
@@ -227,6 +494,72 @@ class MeetupBot(commands.Bot):
                     continue
 
         logger.info("Finished posting all events to Discord")
+
+    async def post_event(self, event, channel):
+        """Post a single event to Discord"""
+        try:
+            # Generate UUID for this event
+            event_uuid = str(uuid.uuid4())
+            
+            # Format the event data for storage
+            formatted_event = {
+                'title': event['title'],
+                'start_time': event['time'],
+                'end_time': event['time'] + timedelta(hours=1),  # Default 1-hour duration
+                'location': event['location']['name'] if isinstance(event['location'], dict) else event['location'],
+                'description': event.get('description', ''),
+                'url': event['url'],
+                'calendar_url': f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={urllib.parse.quote(event['title'])}&dates={event['time'].strftime('%Y%m%dT%H%M%S')}/{event['time'].strftime('%Y%m%dT%H%M%S')}&details={urllib.parse.quote(event['url'])}",
+                'location_url': None
+            }
+            
+            # Store event data in memory and database
+            self.event_data_map[event_uuid] = formatted_event
+            self.save_event_data(event_uuid, formatted_event)
+            
+            # Create buttons with UUID
+            view = discord.ui.View()
+            view.add_item(CreateEventButton(event_uuid, formatted_event['calendar_url'], formatted_event['location_url']))
+            view.add_item(CalendarButton(formatted_event['calendar_url']))
+            if formatted_event['location_url']:
+                view.add_item(LocationButton(formatted_event['location_url']))
+            
+            # Format and post the event message
+            content = format_event_message(event)
+            await channel.send(content=content, view=view)
+            logger.info(f"Posted event: {event['title']}")
+            
+        except Exception as e:
+            logger.error(f"Error posting event: {e}")
+            logger.error(traceback.format_exc())
+
+    async def send_meetup_message(self, event_uuid: str, event_data: dict):
+        """Send a message about a new meetup event."""
+        try:
+            # Get the channel
+            channel = self.get_channel(self.discord_channel_id)
+            if not channel:
+                logger.error(f"Could not find channel {self.discord_channel_id}")
+                return
+
+            # Create the message
+            message = (
+                f"🎉 **New Meetup Event!**\n\n"
+                f"**{event_data['title']}**\n"
+                f"📅 {event_data['date']}\n"
+                f"⏰ {event_data['time']}\n"
+                f"📍 {event_data['location']}\n"
+                f"🔗 [View on Meetup]({event_data['url']})"
+            )
+
+            # Send the message with the button
+            view = CreateEventView(event_uuid, event_data.get('calendar_url', ''), event_data.get('location_url', ''), location_text=event_data.get('location', ''))
+            await channel.send(content=message, view=view)
+            logger.info(f"Sent meetup message for event {event_uuid}")
+
+        except Exception as e:
+            logger.error(f"Error sending meetup message: {str(e)}")
+            logger.error(traceback.format_exc())
 
 def get_meetup_events(search_term: str, location: str, radius: int) -> List[Dict]:
     """Scrape events from Meetup website."""
@@ -383,7 +716,6 @@ def format_event_message(event):
         display_title = f"[{search_term.capitalize()}] {title}"
     # Create a clean title and make it a clickable link
     clean_title = f"[{display_title}]({event['url']})"
-    meetup_title = f"[Meetup] {title}"
     
     # Clean and truncate the description
     description = event.get('description', '')
@@ -407,16 +739,21 @@ def format_event_message(event):
     start_date = event_time.strftime('%Y%m%dT%H%M%S')
     end_date = (event_time + timedelta(hours=1)).strftime('%Y%m%dT%H%M%S')
     
-    # Create the Google Calendar URL
+    # Create the Google Calendar URL with truncated title
+    calendar_title = title[:100]  # Truncate title to avoid URL length issues
     calendar_url = (
         f"https://calendar.google.com/calendar/render"
         f"?action=TEMPLATE"
-        f"&text={urllib.parse.quote(meetup_title)}"
+        f"&text={urllib.parse.quote(calendar_title)}"
         f"&dates={start_date}/{end_date}"
+        f"&details={urllib.parse.quote(event['url'])}"
     )
+    
+    # Add location to calendar URL if available, but keep URL under 512 characters
     if location_text and str(location_text).strip():
-        calendar_url += f"&location={urllib.parse.quote(location_text)}"
-        location_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(location_text)}"
+        location_text_truncated = str(location_text)[:100]  # Truncate location text
+        calendar_url += f"&location={urllib.parse.quote(location_text_truncated)}"
+        location_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(location_text_truncated)}"
     else:
         location_url = None
     
@@ -435,14 +772,10 @@ def format_event_message(event):
     else:
         date_text = f"Next Week {day_name}, {date_str} - {time_str}"
 
-    # Inline links to prevent Discord unfurling
-    links = ""
-    # Do not add the Check Location link here; only show as a button
-
-
     # Add online indicator if it's an online event
     online_text = " | ☎️ Online" if event.get('eventAttendanceMode') == 'online' else ""
 
+    # Create the message
     message = (
         f"# {clean_title}\n"
         f"**{event['group']}** | **{date_text}**{online_text}\n"
@@ -453,15 +786,16 @@ def format_event_message(event):
     return {
         'message': message,
         'event_data': {
-            'name': meetup_title,
+            'title': title,  # Remove [Meetup] prefix here
             'start_time': event_time,
             'end_time': event_time + timedelta(hours=1),
-            'location': location_text if location_text and str(location_text).strip() else None,
+            'location': location_text if location_text and str(location_text).strip() else "Online",
             'description': description,
             'url': event['url']
         },
         'calendar_url': calendar_url,
-        'location_url': location_url
+        'location_url': location_url,
+        'location_text': location_text
     }
 
 def main():
